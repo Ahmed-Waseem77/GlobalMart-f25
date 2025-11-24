@@ -12,3 +12,13 @@ scrape_configs:
     - targets:
       - 172.25.0.12:8080
       - 172.25.0.13:8080
+- job_name: 'spark'
+  scrape_interval: 5s
+  static_configs:
+    - targets:
+      - spark-master:7071
+  dns_sd_configs:
+    - names:
+      - spark-worker
+      type: 'A'
+      port: 7071

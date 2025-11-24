@@ -42,6 +42,12 @@ It also comes with a producer-consumer example using a small subset of the [US C
 | prometheus | prom/prometheus | v2.8.1 | 172.25.0.15:9090 |
 | grafana | grafana/grafana | 6.1.1 | 172.25.0.16:3000 |
 | zeppelin | apache/zeppelin | 0.8.1 | 172.25.0.19:8080 |
+| spark-master | bde2020/spark-master | 3.3.0-hadoop3.3 | 172.25.0.20:8081 (UI), :7077 (Master) |
+| spark-worker | bde2020/spark-worker | 3.3.0-hadoop3.3 | 172.25.0.21 |
+| namenode | bde2020/hadoop-namenode | 2.0.0-hadoop3.2.1-java8 | 172.25.0.22:9870 (UI), :8020 (IPC) |
+| datanode | bde2020/hadoop-datanode | 2.0.0-hadoop3.2.1-java8 | 172.25.0.23 |
+| hbase-master | bde2020/hbase-master | 1.0.0-hbase1.2.6 | 172.25.0.24:16010 (UI), :16000 (IPC) |
+| hbase-regionserver | bde2020/hbase-regionserver | 1.0.0-hbase1.2.6 | 172.25.0.25 |
 
 # Quickstart
 
@@ -134,3 +140,16 @@ Finally, you can access the default kafka dashboard in Grafana (username is "adm
 
 
 
+
+## Scaling Services
+
+You can scale the Spark workers, HDFS datanodes, and HBase regionservers using the `--scale` flag:
+
+```bash
+docker-compose up -d --scale spark-worker=3 --scale datanode=3 --scale hbase-regionserver=3
+```
+
+Note:
+- **spark-worker**: Scales the number of Spark worker nodes.
+- **datanode**: Scales the number of HDFS data nodes. Each node uses a separate anonymous volume.
+- **hbase-regionserver**: Scales the number of HBase region servers.
