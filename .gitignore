@@ -1,4 +1,6 @@
 tags
 .zed/
 .vscode/
-/.ipynb_checkpoints/
+.ipynb_checkpoints/
+current/
+in_use.lock

@@ -16,15 +16,11 @@ It also comes with a producer-consumer example using a small subset of the [US C
 <h2>Monitoring with grafana</h2>
 <img src="images/grafanakafka.jpg" alt="">
 </td>
-<td>
-<h2>Zeppelin UI</h2>
-<img src="images/zeppelin-2.jpg" alt="">
-</td>
-</tr>
 <td style="width: 50%">
 <h2>Kafka access from host</h2>
 <img src="images/console.jpg" alt="">
 </td>
+</tr>
 <td style="width: 50%">
 <h2>Multiple spark interpreters</h2>
 <img src="images/sparkui.jpg" alt="">
@@ -41,11 +37,10 @@ It also comes with a producer-consumer example using a small subset of the [US C
 | kafka_manager | hlebalbau/kafka_manager | 1.3.3.18 | 172.25.0.14:9000 |
 | prometheus | prom/prometheus | v2.8.1 | 172.25.0.15:9090 |
 | grafana | grafana/grafana | 6.1.1 | 172.25.0.16:3000 |
-| zeppelin | apache/zeppelin | 0.8.1 | 172.25.0.19:8080 |
 | spark-master | bde2020/spark-master | 3.3.0-hadoop3.3 | 172.25.0.20:8081 (UI), :7077 (Master) |
-| spark-worker | bde2020/spark-worker | 3.3.0-hadoop3.3 | 172.25.0.21 |
+| spark-worker(s) | bde2020/spark-worker | 3.3.0-hadoop3.3 | 172.25.0.21 |
 | namenode | bde2020/hadoop-namenode | 2.0.0-hadoop3.2.1-java8 | 172.25.0.22:9870 (UI), :8020 (IPC) |
-| datanode | bde2020/hadoop-datanode | 2.0.0-hadoop3.2.1-java8 | 172.25.0.23 |
+| datanode(s) | bde2020/hadoop-datanode | 2.0.0-hadoop3.2.1-java8 | 172.25.0.23 |
 | hbase-master | bde2020/hbase-master | 1.0.0-hbase1.2.6 | 172.25.0.24:16010 (UI), :16000 (IPC) |
 | hbase-regionserver | bde2020/hbase-regionserver | 1.0.0-hbase1.2.6 | 172.25.0.25 |
 
@@ -136,9 +131,6 @@ If your cluster was named "Kafka", then you can go to http://172.25.0.14:9000/cl
 Finally, you can access the default kafka dashboard in Grafana (username is "admin" and password is "password") by going to http://172.25.0.16:3000/d/xyAGlzgWz/kafka?orgId=1
 
 ![](images/grafanakafka.jpg)
-
-
-
 
 
 ## Scaling Services
