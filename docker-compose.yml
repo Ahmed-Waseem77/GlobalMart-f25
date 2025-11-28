@@ -154,15 +154,13 @@ services:
     image: apache/hadoop:3
     container_name: namenode
     command: ["hdfs", "namenode"]
-    user: root # Required to ensure permission to write to mounted volumes
-    environment:
-      - HADOOP_HOME=/opt/hadoop
     volumes:
-      # Mount the local config files to the container's config path
-      - ./hadoop_config/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml
-      - ./hadoop_config/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml
-      # Persist data
-      - ./namenode:/opt/hadoop/data/nameNode.envNn.envN
+      - ./namenode:/hadoop/dfs/name
+    env_file:
+      - ./hadoop_config/config
+    environment: 
+      ENSURE_NAMENODE_DIR: "/tmp/hadoop-root/dfs/name"
+      HDFS-SITE.XML_dfs.namenode.rpc-address: "0.0.0.0:8020"
     expose:
       - "9870"
       - "8020"
@@ -177,27 +175,22 @@ services:
       timeout: 10s
       retries: 15
       start_period: 90s
+    depends_on:
+      - zookeeper
 
   datanode:
     image: apache/hadoop:3
     container_name: datanode
     command: ["hdfs", "datanode"]
-    volumes:
-      - datanode:/hadoop/dfs/data
-    environment:
-      - SERVICE_PRECONDITION=namenode:9870
-      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+    env_file:
+      - ./hadoop_config/config
     depends_on:
       namenode:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9864/"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
     networks:
       kafkanet:
         ipv4_address: 172.25.0.23
+
 
   hbase-master:
     image: bde2020/hbase-master:1.0.0-hbase1.2.6
@@ -217,8 +210,6 @@ services:
     depends_on:
       namenode:
         condition: service_healthy
-      datanode:
-        condition: service_started
       zookeeper:
         condition: service_started
     networks:

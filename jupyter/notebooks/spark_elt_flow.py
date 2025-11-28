@@ -139,7 +139,7 @@ def read_kafka_stream(spark, topic):
         .format("kafka") \
         .option("kafka.bootstrap.servers", KAFKA_BROKERS) \
         .option("subscribe", topic) \
-        .option("startingOffsets", "latest") \
+        .option("startingOffsets", "earliest") \
         .load()
 
 def generate_uuid():
