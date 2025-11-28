@@ -151,13 +151,18 @@ services:
       - kafkanet
 
   namenode:
-    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    image: apache/hadoop:3
     container_name: namenode
-    volumes:
-      - ./namenode:/hadoop/dfs/name
+    command: ["hdfs", "namenode"]
+    user: root # Required to ensure permission to write to mounted volumes
     environment:
-      - CLUSTER_NAME=test
-      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+      - HADOOP_HOME=/opt/hadoop
+    volumes:
+      # Mount the local config files to the container's config path
+      - ./hadoop_config/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml
+      - ./hadoop_config/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml
+      # Persist data
+      - ./namenode:/opt/hadoop/data/nameNode.envNn.envN
     expose:
       - "9870"
       - "8020"
@@ -166,18 +171,33 @@ services:
     networks:
       kafkanet:
         ipv4_address: 172.25.0.22
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:9870/"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 90s
 
   datanode:
-    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    image: apache/hadoop:3
+    container_name: datanode
+    command: ["hdfs", "datanode"]
     volumes:
-      - /hadoop/dfs/data
+      - datanode:/hadoop/dfs/data
     environment:
       - SERVICE_PRECONDITION=namenode:9870
       - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
     depends_on:
-      - namenode
+      namenode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9864/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
     networks:
-      - kafkanet
+      kafkanet:
+        ipv4_address: 172.25.0.23
 
   hbase-master:
     image: bde2020/hbase-master:1.0.0-hbase1.2.6
@@ -195,9 +215,12 @@ services:
     ports:
       - "16010:16010"
     depends_on:
-      - namenode
-      - datanode
-      - zookeeper
+      namenode:
+        condition: service_healthy
+      datanode:
+        condition: service_started
+      zookeeper:
+        condition: service_started
     networks:
       kafkanet:
         ipv4_address: 172.25.0.24
@@ -258,4 +281,5 @@ volumes:
   kafka_kafka1:
   kafka_kafka2:
   namenode:
+  datanode:
 
