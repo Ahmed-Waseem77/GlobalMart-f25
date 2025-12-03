@@ -1,6 +1,5 @@
-![GitHub](https://img.shields.io/badge/Release-PROD-green.svg)
-![GitHub](https://img.shields.io/badge/Version-0.0.1-lightgrey.svg)
-![GitHub](https://img.shields.io/badge/License-MIT-blue.svg)
+
+# Containers
 
 | Container | Image | Tag | Accessible | 
 |-|-|-|-|
@@ -45,7 +44,7 @@ docker stats
 ## Operations
 
 ### Jupyter Notebook
-Just open a browser and visit localhost:8888, password `admin`
+Just open a browser and visit localhost:8888, password `password`
 
 ### Monitor Kafka
 
