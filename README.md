@@ -2,33 +2,6 @@
 ![GitHub](https://img.shields.io/badge/Version-0.0.1-lightgrey.svg)
 ![GitHub](https://img.shields.io/badge/License-MIT-blue.svg)
 
-# One Click Deploy: Kafka Spark Streaming with Zeppelin UI
-
-This repository contains a docker-compose stack with Kafka and Spark Streaming, together with monitoring with Kafka Manager and a Grafana Dashboard. The networking is set up so Kafka brokers can be accessed from the host.
-
-It also comes with a producer-consumer example using a small subset of the [US Census adult income prediction dataset](https://www.kaggle.com/johnolafenwa/us-census-data).
-
-## High level features:
-
-<table>
-<tr>
-<td style="width: 50%">
-<h2>Monitoring with grafana</h2>
-<img src="images/grafanakafka.jpg" alt="">
-</td>
-<td style="width: 50%">
-<h2>Kafka access from host</h2>
-<img src="images/console.jpg" alt="">
-</td>
-</tr>
-<td style="width: 50%">
-<h2>Multiple spark interpreters</h2>
-<img src="images/sparkui.jpg" alt="">
-</td>
-</table>
-
-## Detail Summary
-
 | Container | Image | Tag | Accessible | 
 |-|-|-|-|
 | zookeeper | wurstmeister/zookeeper | latest | 172.25.0.11:2181 |
@@ -38,11 +11,12 @@ It also comes with a producer-consumer example using a small subset of the [US C
 | prometheus | prom/prometheus | v2.8.1 | 172.25.0.15:9090 |
 | grafana | grafana/grafana | 6.1.1 | 172.25.0.16:3000 |
 | spark-master | bde2020/spark-master | 3.3.0-hadoop3.3 | 172.25.0.20:8081 (UI), :7077 (Master) |
-| spark-worker(s) | bde2020/spark-worker | 3.3.0-hadoop3.3 | 172.25.0.21 |
+| spark-worker | bde2020/spark-worker | 3.3.0-hadoop3.3 | 172.25.0.21 |
 | namenode | bde2020/hadoop-namenode | 2.0.0-hadoop3.2.1-java8 | 172.25.0.22:9870 (UI), :8020 (IPC) |
-| datanode(s) | bde2020/hadoop-datanode | 2.0.0-hadoop3.2.1-java8 | 172.25.0.23 |
+| datanode | bde2020/hadoop-datanode | 2.0.0-hadoop3.2.1-java8 | 172.25.0.23 |
 | hbase-master | bde2020/hbase-master | 1.0.0-hbase1.2.6 | 172.25.0.24:16010 (UI), :16000 (IPC) |
 | hbase-regionserver | bde2020/hbase-regionserver | 1.0.0-hbase1.2.6 | 172.25.0.25 |
+| Jupyter | jupyter/pyspark-notebook | latest | 172.25.0.19 | :4040, :8888 (UI) |
 
 # Quickstart
 
@@ -68,43 +42,12 @@ To see the memory and CPU usage (which comes in handy to ensure docker has enoug
 docker stats
 ```
 
-## Accessing the notebook
+## Operations
 
-You can access the default notebook by going to http://172.25.0.19:8080/#/notebook/2EAB941ZD. Now we can start running the cells.
+### Jupyter Notebook
+Just open a browser and visit localhost:8888, password `admin`
 
-### 1) Setup
-
-#### Install python-kafka dependency
-
-![](images/zeppelin-1.jpg)
-
-### 2) Producer
-
-We have an interpreter called %producer.pyspark that we'll be able to run in parallel.
-
-#### Load our example dummy dataset
-
-We have made available a 1000-row version of the [US Census adult income prediction dataset](https://www.kaggle.com/johnolafenwa/us-census-data).
-
-![](images/zeppelin-2.jpg)
-
-#### Start the stream of rows
-
-We now take one row at random, and send it using our python-kafka producer. The topic will be created automatically if it doesn't exist (given that `auto.create.topics.enable` is set to true).
-
-![](images/zeppelin-3.jpg)
-
-### 3) Consumer
-
-We now use the %consumer.pyspark interpreter to run our pyspark job in parallel to the producer.
-
-#### Connect to the stream and print
-
-Now we can run the spark stream job to connect to the topic and listen to data. The job will listen for windows of 2 seconds and will print the ID and "label" for all the rows within that window.
-
-![](images/zeppelin-4.jpg)
-
-### 4) Monitor Kafka
+### Monitor Kafka
 
 We can now use the kafka manager to dive into the current kafka setup.
 
@@ -120,28 +63,86 @@ Optionally:
     * Enable JMX Polling
     * Poll consumer information
 
-#### Access the topic information
-
-If your cluster was named "Kafka", then you can go to http://172.25.0.14:9000/clusters/Kafka/topics/default_topic, where you will be able to see the partition offsets. Given that the topic was created automatically, it will have only 1 partition.
-
-![](images/zeppelin-4.jpg)
-
 #### Visualise metrics in Grafana
 
 Finally, you can access the default kafka dashboard in Grafana (username is "admin" and password is "password") by going to http://172.25.0.16:3000/d/xyAGlzgWz/kafka?orgId=1
 
 ![](images/grafanakafka.jpg)
 
+Monitoring is set up by promethues source for both kafka and spark containers.
+
 
 ## Scaling Services
-
 You can scale the Spark workers, HDFS datanodes, and HBase regionservers using the `--scale` flag:
 
 ```bash
-docker-compose up -d --scale spark-worker=3 --scale datanode=3 --scale hbase-regionserver=3
+docker-compose up -d --scale spark-worker=3 --scale hbase-regionserver=3
 ```
 
-Note:
-- **spark-worker**: Scales the number of Spark worker nodes.
-- **datanode**: Scales the number of HDFS data nodes. Each node uses a separate anonymous volume.
-- **hbase-regionserver**: Scales the number of HBase region servers.
+>[!NOTE]
+> - **spark-worker**: Scales the number of Spark worker nodes.
+> - **hbase-regionserver**: Scales the number of HBase region servers.
+
+>[!WARNING]
+> To Scale datanodes you need to scale them manually by adding datanode nodes with a fixed IP in `docker-compose.yml`
+> This is due to dynamically scaled datanodes not able to communicate with the namenode, which fails our HBase.
+> _We suspect this is due to them not being given an IP but more investigation is needed_
+
+
+## Running GlobalMart
+
+First Navigate to the Jupyter Console on the browser on `localhost:8888`
+
+Install global dependencies in the node with 
+
+```
+pip install -r requirements.txt
+```
+
+Run the data generation script 
+
+```
+python stream.py
+```
+ 
+In a second terminal initialize the HBASE schema and run the ETL Flow
+
+```
+python spark_etl_flow.py
+```
+
+In a third terminal you can run any of the validation script to make sure the flow is working.
+
+## Data Generation Script
+
+There are multiple Patterns that are coded in the data stream to evoke the sense of real data.
+
+### Users
+- **Demographics**: Users are generated with a weighted distribution across 5 countries: Egypt (Dominant), Eswatini, Timor-Leste, Cambodia, and Federated States of Micronesia.
+- **Age**: Ages follow a normal distribution (mean=26, std_dev=10), clipped to the range [18, 90].
+- **Email**: Randomly assigned from common domains (gmail, yahoo, etc.).
+
+### Products
+- **Categories**: Electronics, Clothing, Home, Books, Sports, Beauty, Toys.
+- **Pricing & Inventory**:
+    - **Electronics**: High price ($100-$3000), Low inventory.
+    - **Books**: Low price ($5-$50), High inventory.
+    - **Clothing**: Mid-range price ($10-$200), Mid-range inventory.
+    - **Others**: General price ($10-$500) and inventory ranges.
+- **Ratings**: Normally distributed (mean=4.2, std_dev=0.8), clipped to [1.0, 5.0].
+
+### Transactions
+- **Buying Patterns**: Users have country-specific category preferences (e.g., users from Egypt prefer Electronics and Clothing).
+- **Product Selection**: 50% chance to select products matching the user's country preference.
+- **Payment Methods**: Randomly selected from Credit Card, PayPal, Debit Card, Apple Pay, Google Pay.
+
+### Sessions
+- **Activity**: Each session contains 1-10 events.
+- **Event Types**: ADD_TO_CART, REMOVE_FROM_CART, CLEAR_CART.
+
+### Data Quality (Chaos Engineering)
+- **Null Injection**:
+    - **Critical IDs** (product_id, session_id): 1% chance of being NULL.
+    - **General Fields**: 0.5% chance of being NULL.
+    - **Key Fields** (transaction_id, user_id, timestamp): Never NULL.
+##
