@@ -23,7 +23,7 @@ The easiest way to understand the setup is by diving into it and interacting wit
 
 ## ETL Flow
 
-![](images/big\ data.png)
+![](images/big_data.png)
 
 ## Running Docker Compose
 
