@@ -21,6 +21,10 @@
 
 The easiest way to understand the setup is by diving into it and interacting with it.
 
+## ETL Flow
+
+![](images/big\ data.png)
+
 ## Running Docker Compose
 
 To run docker compose simply run the following command in the current folder:
@@ -59,7 +63,7 @@ To set up kafka manager we need to configure it. In order to do this, access htt
 
 Optionally:
 * You can tick the following;
-    * Enable JMX Polling
+    * Enable JMX Pollingimages
     * Poll consumer information
 
 #### Visualise metrics in Grafana
