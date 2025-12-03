@@ -249,7 +249,7 @@ services:
     expose:
       - "9091"
     ports:
-      - "9091:9091"
+      - "9095:9091"
     depends_on:
       - hbase-master
       - hbase-regionserver

@@ -19,7 +19,7 @@ Topics consumed:
 - new_sessions
 
 Usage:
-    spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0 spark_elt_flow.py
+    spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 spark_elt_flow.py
     Or run directly in Jupyter with PySpark kernel
 """
 
@@ -67,7 +67,7 @@ def create_spark_session():
     """Create and configure Spark session."""
     spark = SparkSession.builder \
         .appName("GlobalMart-ELT-Pipeline") \
-        .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0") \
+        .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0") \
         .config("spark.sql.streaming.checkpointLocation", CHECKPOINT_PATH) \
         .config("spark.sql.shuffle.partitions", "8") \
         .config("spark.streaming.stopGracefullyOnShutdown", "true") \
@@ -573,8 +573,10 @@ def process_sessions(spark):
 # HBase write functions
 def get_hbase_connection():
     """Get HBase connection."""
-    return happybase.Connection(host=HBASE_HOST, port=HBASE_PORT)
-
+    return happybase.Connection(
+            host=HBASE_HOST, 
+            port=HBASE_PORT
+        )
 def write_users_to_hbase(batch_df, batch_id):
     """Write user batch to HBase dim_users table."""
     if batch_df.isEmpty():
