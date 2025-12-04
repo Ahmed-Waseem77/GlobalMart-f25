@@ -6,11 +6,12 @@ This pipeline implements a three-stream data flow:
 1. Extract: Read streaming data from Kafka topics
 2. Transform: Parse JSON and validate data using Spark DataFrame operations
 3. Load (Three streams):
-   a. Invalid data -> HDFS audit path (/audit/<topic>/) for manual review
+   a. Invalid data -> Console/File audit for manual review
    b. Valid data -> Process (stub) -> Kafka processed topics
-   c. Valid data -> Process (stub) -> HBase star schema
+   c. Valid data -> Process (stub) -> MongoDB star schema (via PyMongo)
 
 All processing is done using Spark DataFrame operations on the cluster.
+MongoDB writes use PyMongo directly to avoid Spark connector version issues.
 
 Topics consumed:
 - new_users
@@ -19,7 +20,7 @@ Topics consumed:
 - new_sessions
 
 Usage:
-    spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 spark_elt_flow.py
+    spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0 spark_etl_flow.py
     Or run directly in Jupyter with PySpark kernel
 """
 
@@ -27,21 +28,23 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, from_json, to_json, struct, current_timestamp, 
     date_format, year, month, dayofmonth, hour, dayofweek, quarter,
-    size, when, lit, concat_ws, concat, lpad, udf
+    size, when, lit, concat_ws, concat, lpad, udf, expr
 )
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, 
-    FloatType, ArrayType, TimestampType
+    FloatType, ArrayType, TimestampType, DoubleType
 )
-import happybase
+from pymongo import MongoClient
+from pymongo.errors import BulkWriteError
 import uuid
 from datetime import datetime
 
 # Configuration
 KAFKA_BROKERS = "kafka1:9092,kafka2:9092"
-HDFS_NAMENODE = "hdfs://namenode:8020"
-HBASE_HOST = "hbase-thrift"
-HBASE_PORT = 9091
+
+# MongoDB Configuration
+MONGODB_URI = "mongodb://mongo1:27017,mongo2:27017,mongo3:27017/?replicaSet=rs0"
+MONGODB_DATABASE = "globalmart"
 
 # Kafka topics - source
 TOPICS = {
@@ -59,15 +62,15 @@ PROCESSED_TOPICS = {
     'sessions': 'processed_sessions'
 }
 
-# HDFS paths
-HDFS_AUDIT_PATH = f"{HDFS_NAMENODE}/audit"
-CHECKPOINT_PATH = f"{HDFS_NAMENODE}/checkpoints"
+# Local checkpoint path (no HDFS)
+CHECKPOINT_PATH = "/tmp/spark_checkpoints"
+
 
 def create_spark_session():
     """Create and configure Spark session."""
     spark = SparkSession.builder \
         .appName("GlobalMart-ELT-Pipeline") \
-        .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0") \
+        .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0") \
         .config("spark.sql.streaming.checkpointLocation", CHECKPOINT_PATH) \
         .config("spark.sql.shuffle.partitions", "8") \
         .config("spark.streaming.stopGracefullyOnShutdown", "true") \
@@ -76,6 +79,7 @@ def create_spark_session():
     spark.sparkContext.setLogLevel("WARN")
     print("✓ Spark session created")
     return spark
+
 
 # Define schemas for each topic
 def get_user_schema():
@@ -159,7 +163,6 @@ def process_users_data(df):
     Returns:
         tuple: (valid_df, invalid_df)
     """
-    # Apply processing logic using Spark DataFrame operations
     processed_df = df.withColumn(
         "processing_valid",
         when(col("email").isNull(), lit(False)).otherwise(lit(True))
@@ -168,7 +171,6 @@ def process_users_data(df):
         when(col("email").isNull(), lit("email is required for user contact")).otherwise(lit(None))
     )
     
-    # Split into valid and invalid
     valid_df = processed_df.filter(col("processing_valid") == True).drop("processing_valid", "processing_rejection_reason")
     invalid_df = processed_df.filter(col("processing_valid") == False).drop("processing_valid")
     
@@ -183,12 +185,7 @@ def process_products_data(df):
     - If price < 0 → reject
     - If inventory < 0 → reject
     - If ratings < 0 → set to 0
-    - NULL category is acceptable
-    
-    Returns:
-        tuple: (valid_df, invalid_df)
     """
-    # Apply transformations using Spark DataFrame operations
     processed_df = df.withColumn(
         "product_id",
         when(col("product_id").isNull(), generate_uuid_udf()).otherwise(col("product_id"))
@@ -208,7 +205,6 @@ def process_products_data(df):
         .otherwise(lit(None))
     )
     
-    # Split into valid and invalid
     valid_df = processed_df.filter(col("processing_valid") == True).drop("processing_valid", "processing_rejection_reason")
     invalid_df = processed_df.filter(col("processing_valid") == False).drop("processing_valid")
     
@@ -220,11 +216,7 @@ def process_transactions_data(df):
     
     Rules:
     - If payment_method is NULL → reject
-    
-    Returns:
-        tuple: (valid_df, invalid_df)
     """
-    # Apply processing logic using Spark DataFrame operations
     processed_df = df.withColumn(
         "processing_valid",
         when(col("payment_method").isNull(), lit(False)).otherwise(lit(True))
@@ -233,7 +225,6 @@ def process_transactions_data(df):
         when(col("payment_method").isNull(), lit("payment_method is required")).otherwise(lit(None))
     )
     
-    # Split into valid and invalid
     valid_df = processed_df.filter(col("processing_valid") == True).drop("processing_valid", "processing_rejection_reason")
     invalid_df = processed_df.filter(col("processing_valid") == False).drop("processing_valid")
     
@@ -245,64 +236,34 @@ def process_sessions_data(df):
     
     Rules:
     - If session_id is NULL → generate UUID
-    
-    Returns:
-        tuple: (valid_df, invalid_df) - invalid_df will be empty for sessions
     """
-    # Apply transformations using Spark DataFrame operations
     processed_df = df.withColumn(
         "session_id",
         when(col("session_id").isNull(), generate_uuid_udf()).otherwise(col("session_id"))
     )
     
-    # For sessions, all records are valid after ID generation
-    # Return empty invalid DataFrame with same schema
     invalid_df = processed_df.filter(lit(False)).withColumn("processing_rejection_reason", lit(None))
     
     return (processed_df, invalid_df)
 
-def write_invalid_to_hdfs(df, topic_name, rejection_reason_col="rejection_reason"):
-    """
-    Write invalid records to HDFS audit path for manual review.
-    Uses Spark DataFrame operations for distributed processing.
-    
-    Args:
-        df: Spark DataFrame with invalid records
-        topic_name: Source topic name for partitioning
-        rejection_reason_col: Column name containing rejection reason
-        
-    Returns:
-        Streaming query handle
-    """
+def write_invalid_to_console(df, topic_name, rejection_reason_col="rejection_reason"):
+    """Write invalid records to console for debugging/audit."""
     query = df \
-        .withColumn("audit_date", date_format(current_timestamp(), "yyyy-MM-dd")) \
         .withColumn("audit_timestamp", current_timestamp()) \
+        .withColumn("source_topic", lit(topic_name)) \
         .writeStream \
-        .format("parquet") \
-        .option("path", f"{HDFS_AUDIT_PATH}/{topic_name}") \
+        .format("console") \
+        .option("truncate", "false") \
         .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic_name}_audit") \
-        .partitionBy("audit_date") \
         .outputMode("append") \
         .trigger(processingTime='10 seconds') \
         .start()
     
-    print(f"✓ Started streaming invalid {topic_name} records to HDFS audit")
+    print(f"✓ Started streaming invalid {topic_name} records to console")
     return query
 
 def write_processed_to_kafka(df, processed_topic, checkpoint_suffix):
-    """
-    Write processed data to Kafka topic for downstream consumers.
-    Uses Spark DataFrame operations for distributed processing.
-    
-    Args:
-        df: Spark DataFrame with processed records
-        processed_topic: Target Kafka topic name
-        checkpoint_suffix: Unique checkpoint identifier
-        
-    Returns:
-        Streaming query handle
-    """
-    # Convert DataFrame to JSON for Kafka
+    """Write processed data to Kafka topic for downstream consumers."""
     kafka_df = df.select(
         to_json(struct(*df.columns)).alias("value")
     )
@@ -319,27 +280,256 @@ def write_processed_to_kafka(df, processed_topic, checkpoint_suffix):
     print(f"✓ Started streaming processed data to Kafka topic: {processed_topic}")
     return query
 
+
+# ==================== MongoDB Write Functions (using PyMongo) ====================
+
+def get_mongodb_client():
+    """Get a MongoDB client connection."""
+    return MongoClient(MONGODB_URI)
+
+
+def generate_time_id_from_str(timestamp_str):
+    """Generate time_id in format YYYYMMDDHH from timestamp string."""
+    try:
+        dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        return dt.strftime('%Y%m%d%H')
+    except:
+        dt = datetime.now()
+        return dt.strftime('%Y%m%d%H')
+
+
+def write_time_dimension(client, timestamp_str):
+    """Write time dimension to MongoDB if not exists."""
+    time_id = generate_time_id_from_str(timestamp_str)
+    
+    try:
+        dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+    except:
+        dt = datetime.now()
+    
+    db = client[MONGODB_DATABASE]
+    collection = db["dim_time"]
+    
+    # Upsert time dimension
+    collection.update_one(
+        {"time_id": time_id},
+        {"$setOnInsert": {
+            "time_id": time_id,
+            "year": dt.year,
+            "month": dt.month,
+            "day": dt.day,
+            "hour": dt.hour,
+            "day_of_week": dt.weekday(),
+            "quarter": (dt.month - 1) // 3 + 1,
+            "is_weekend": dt.weekday() >= 5
+        }},
+        upsert=True
+    )
+    
+    return time_id
+
+
+def write_users_to_mongodb(batch_df, batch_id):
+    """Write user batch to MongoDB dim_users collection using PyMongo."""
+    if batch_df.isEmpty():
+        return
+    
+    count = batch_df.count()
+    print(f"Writing users batch {batch_id} with {count} records to MongoDB...")
+    
+    try:
+        client = get_mongodb_client()
+        db = client[MONGODB_DATABASE]
+        collection = db["dim_users"]
+        
+        now = datetime.now()
+        documents = []
+        
+        for row in batch_df.collect():
+            doc = {
+                "user_id": row.user_id,
+                "email": row.email,
+                "age": row.age,
+                "country": row.country,
+                "registration_date": row.registeration_date,
+                "created_at": now,
+                "updated_at": now
+            }
+            documents.append(doc)
+        
+        if documents:
+            collection.insert_many(documents, ordered=False)
+        
+        client.close()
+        print(f"✓ Batch {batch_id}: Written {count} users to MongoDB")
+    except BulkWriteError as e:
+        print(f"✓ Batch {batch_id}: Written {count - len(e.details.get('writeErrors', []))} users (some duplicates skipped)")
+    except Exception as e:
+        print(f"✗ Error writing users batch {batch_id}: {e}")
+
+
+def write_products_to_mongodb(batch_df, batch_id):
+    """Write product batch to MongoDB dim_products collection using PyMongo."""
+    if batch_df.isEmpty():
+        return
+    
+    count = batch_df.count()
+    print(f"Writing products batch {batch_id} with {count} records to MongoDB...")
+    
+    try:
+        client = get_mongodb_client()
+        db = client[MONGODB_DATABASE]
+        collection = db["dim_products"]
+        
+        now = datetime.now()
+        documents = []
+        
+        for row in batch_df.collect():
+            doc = {
+                "product_id": row.product_id,
+                "name": row.name,
+                "category": row.category,
+                "price": float(row.price) if row.price else None,
+                "inventory": row.inventory,
+                "rating": float(row.ratings) if row.ratings else None,
+                "created_at": now,
+                "updated_at": now
+            }
+            documents.append(doc)
+        
+        if documents:
+            collection.insert_many(documents, ordered=False)
+        
+        client.close()
+        print(f"✓ Batch {batch_id}: Written {count} products to MongoDB")
+    except BulkWriteError as e:
+        print(f"✓ Batch {batch_id}: Written {count - len(e.details.get('writeErrors', []))} products (some duplicates skipped)")
+    except Exception as e:
+        print(f"✗ Error writing products batch {batch_id}: {e}")
+
+
+def write_transactions_to_mongodb(batch_df, batch_id):
+    """Write transaction batch to MongoDB fact_transactions collection using PyMongo."""
+    if batch_df.isEmpty():
+        return
+    
+    count = batch_df.count()
+    print(f"Writing transactions batch {batch_id} with {count} records to MongoDB...")
+    
+    try:
+        client = get_mongodb_client()
+        db = client[MONGODB_DATABASE]
+        collection = db["fact_transactions"]
+        
+        documents = []
+        
+        for row in batch_df.collect():
+            # Calculate total amount
+            total_amount = 0.0
+            products_list = []
+            
+            if row.products:
+                for p in row.products:
+                    price = float(p.price) if p.price else 0.0
+                    qty = int(p.quantity) if p.quantity else 0
+                    total_amount += price * qty
+                    products_list.append({
+                        "product_id": p.product_id,
+                        "quantity": qty,
+                        "price": price
+                    })
+            
+            # Write time dimension
+            time_id = write_time_dimension(client, row.timestamp)
+            
+            doc = {
+                "transaction_id": row.transaction_id,
+                "user_id": row.user_id,
+                "time_id": time_id,
+                "timestamp": row.timestamp,
+                "total_amount": total_amount,
+                "payment_method": row.payment_method,
+                "products": products_list,
+                "num_products": len(products_list)
+            }
+            documents.append(doc)
+        
+        if documents:
+            collection.insert_many(documents, ordered=False)
+        
+        client.close()
+        print(f"✓ Batch {batch_id}: Written {count} transactions to MongoDB")
+    except BulkWriteError as e:
+        print(f"✓ Batch {batch_id}: Written {count - len(e.details.get('writeErrors', []))} transactions (some duplicates skipped)")
+    except Exception as e:
+        print(f"✗ Error writing transactions batch {batch_id}: {e}")
+
+
+def write_sessions_to_mongodb(batch_df, batch_id):
+    """Write session batch to MongoDB fact_sessions collection using PyMongo."""
+    if batch_df.isEmpty():
+        return
+    
+    count = batch_df.count()
+    print(f"Writing sessions batch {batch_id} with {count} records to MongoDB...")
+    
+    try:
+        client = get_mongodb_client()
+        db = client[MONGODB_DATABASE]
+        collection = db["fact_sessions"]
+        
+        documents = []
+        
+        for row in batch_df.collect():
+            events_list = []
+            
+            if row.events:
+                for e in row.events:
+                    events_list.append({
+                        "event_type": e.eventType,
+                        "event_timestamp": e.timestamp
+                    })
+            
+            # Write time dimension
+            time_id = write_time_dimension(client, row.timestamp)
+            
+            doc = {
+                "session_id": row.session_id,
+                "user_id": row.user_id,
+                "time_id": time_id,
+                "timestamp": row.timestamp,
+                "num_events": len(events_list),
+                "session_duration": len(events_list) * 10,  # Estimate 10 sec per event
+                "events": events_list
+            }
+            documents.append(doc)
+        
+        if documents:
+            collection.insert_many(documents, ordered=False)
+        
+        client.close()
+        print(f"✓ Batch {batch_id}: Written {count} sessions to MongoDB")
+    except BulkWriteError as e:
+        print(f"✓ Batch {batch_id}: Written {count - len(e.details.get('writeErrors', []))} sessions (some duplicates skipped)")
+    except Exception as e:
+        print(f"✗ Error writing sessions batch {batch_id}: {e}")
+
+
+# ==================== Stream Processing Functions ====================
+
 def process_users(spark):
-    """
-    Process user stream with three-way split:
-    1. Invalid records -> HDFS audit (validation + processing rejections)
-    2. Valid records -> Process -> Kafka
-    3. Valid records -> Process -> HBase
-    """
+    """Process user stream with three-way split."""
     topic = TOPICS['users']
     processed_topic = PROCESSED_TOPICS['users']
     
-    # Read from Kafka
     raw_stream = read_kafka_stream(spark, topic)
     
-    # Parse JSON using Spark operations
     user_schema = get_user_schema()
     parsed_stream = raw_stream \
         .selectExpr("CAST(value AS STRING) as json_value") \
         .select(from_json(col("json_value"), user_schema).alias("data")) \
         .select("data.*")
     
-    # Initial validation using Spark DataFrame operations
     validation_stream = parsed_stream.withColumn(
         "is_valid",
         when(col("user_id").isNotNull(), lit(True)).otherwise(lit(False))
@@ -348,57 +538,40 @@ def process_users(spark):
         when(col("user_id").isNull(), lit("user_id is null")).otherwise(lit(None))
     )
     
-    # Split: validation invalid records
     validation_invalid_stream = validation_stream.filter(col("is_valid") == False)
-    
-    # Valid records for processing
     valid_stream = validation_stream.filter(col("is_valid") == True).drop("is_valid", "rejection_reason")
     
-    # Apply processing (returns valid and invalid DataFrames)
     processed_valid_stream, processing_invalid_stream = process_users_data(valid_stream)
     
-    # Merge validation and processing invalids
-    # Rename processing_rejection_reason to rejection_reason for consistency
     processing_invalid_renamed = processing_invalid_stream.withColumnRenamed("processing_rejection_reason", "rejection_reason")
     combined_invalid_stream = validation_invalid_stream.unionByName(processing_invalid_renamed, allowMissingColumns=True)
     
-    # Stream 1: Combined invalid records to HDFS audit
-    audit_query = write_invalid_to_hdfs(combined_invalid_stream, topic)
-    
-    # Stream 2: Processed valid data to Kafka
+    audit_query = write_invalid_to_console(combined_invalid_stream, topic)
     kafka_query = write_processed_to_kafka(processed_valid_stream, processed_topic, f"{topic}_processed")
     
-    # Stream 3: Processed valid data to HBase
-    hbase_query = processed_valid_stream.writeStream \
-        .foreachBatch(lambda batch_df, batch_id: write_users_to_hbase(batch_df, batch_id)) \
-        .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_hbase") \
+    mongodb_query = processed_valid_stream.writeStream \
+        .foreachBatch(lambda batch_df, batch_id: write_users_to_mongodb(batch_df, batch_id)) \
+        .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_mongodb") \
         .trigger(processingTime='10 seconds') \
         .start()
     
     print(f"✓ Three-stream processing started for {topic}")
-    return [audit_query, kafka_query, hbase_query]
+    return [audit_query, kafka_query, mongodb_query]
+
 
 def process_products(spark):
-    """
-    Process product stream with three-way split:
-    1. Invalid records -> HDFS audit (validation + processing rejections)
-    2. Valid records -> Process -> Kafka
-    3. Valid records -> Process -> HBase
-    """
+    """Process product stream with three-way split."""
     topic = TOPICS['products']
     processed_topic = PROCESSED_TOPICS['products']
     
-    # Read from Kafka
     raw_stream = read_kafka_stream(spark, topic)
     
-    # Parse JSON using Spark operations
     product_schema = get_product_schema()
     parsed_stream = raw_stream \
         .selectExpr("CAST(value AS STRING) as json_value") \
         .select(from_json(col("json_value"), product_schema).alias("data")) \
         .select("data.*")
     
-    # Initial validation (only check name, product_id checked in processing)
     validation_stream = parsed_stream.withColumn(
         "is_valid",
         when(col("name").isNotNull(), lit(True)).otherwise(lit(False))
@@ -407,56 +580,40 @@ def process_products(spark):
         when(col("name").isNull(), lit("name is null")).otherwise(lit(None))
     )
     
-    # Split: validation invalid records
     validation_invalid_stream = validation_stream.filter(col("is_valid") == False)
-    
-    # Valid records for processing
     valid_stream = validation_stream.filter(col("is_valid") == True).drop("is_valid", "rejection_reason")
     
-    # Apply processing (handles product_id generation, price/inventory/ratings validation)
     processed_valid_stream, processing_invalid_stream = process_products_data(valid_stream)
     
-    # Merge validation and processing invalids
     processing_invalid_renamed = processing_invalid_stream.withColumnRenamed("processing_rejection_reason", "rejection_reason")
     combined_invalid_stream = validation_invalid_stream.unionByName(processing_invalid_renamed, allowMissingColumns=True)
     
-    # Stream 1: Combined invalid records to HDFS audit
-    audit_query = write_invalid_to_hdfs(combined_invalid_stream, topic)
-    
-    # Stream 2: Processed valid data to Kafka
+    audit_query = write_invalid_to_console(combined_invalid_stream, topic)
     kafka_query = write_processed_to_kafka(processed_valid_stream, processed_topic, f"{topic}_processed")
     
-    # Stream 3: Processed valid data to HBase
-    hbase_query = processed_valid_stream.writeStream \
-        .foreachBatch(lambda batch_df, batch_id: write_products_to_hbase(batch_df, batch_id)) \
-        .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_hbase") \
+    mongodb_query = processed_valid_stream.writeStream \
+        .foreachBatch(lambda batch_df, batch_id: write_products_to_mongodb(batch_df, batch_id)) \
+        .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_mongodb") \
         .trigger(processingTime='10 seconds') \
         .start()
     
     print(f"✓ Three-stream processing started for {topic}")
-    return [audit_query, kafka_query, hbase_query]
+    return [audit_query, kafka_query, mongodb_query]
+
 
 def process_transactions(spark):
-    """
-    Process transaction stream with three-way split:
-    1. Invalid records -> HDFS audit (validation + processing rejections)
-    2. Valid records -> Process -> Kafka
-    3. Valid records -> Process -> HBase
-    """
+    """Process transaction stream with three-way split."""
     topic = TOPICS['transactions']
     processed_topic = PROCESSED_TOPICS['transactions']
     
-    # Read from Kafka
     raw_stream = read_kafka_stream(spark, topic)
     
-    # Parse JSON using Spark operations
     transaction_schema = get_transaction_schema()
     parsed_stream = raw_stream \
         .selectExpr("CAST(value AS STRING) as json_value") \
         .select(from_json(col("json_value"), transaction_schema).alias("data")) \
         .select("data.*")
     
-    # Initial validation (payment_method checked in processing)
     validation_stream = parsed_stream.withColumn(
         "is_valid",
         when(
@@ -475,56 +632,40 @@ def process_transactions(spark):
         .otherwise(lit(None))
     )
     
-    # Split: validation invalid records
     validation_invalid_stream = validation_stream.filter(col("is_valid") == False)
-    
-    # Valid records for processing
     valid_stream = validation_stream.filter(col("is_valid") == True).drop("is_valid", "rejection_reason")
     
-    # Apply processing (handles payment_method validation)
     processed_valid_stream, processing_invalid_stream = process_transactions_data(valid_stream)
     
-    # Merge validation and processing invalids
     processing_invalid_renamed = processing_invalid_stream.withColumnRenamed("processing_rejection_reason", "rejection_reason")
     combined_invalid_stream = validation_invalid_stream.unionByName(processing_invalid_renamed, allowMissingColumns=True)
     
-    # Stream 1: Combined invalid records to HDFS audit
-    audit_query = write_invalid_to_hdfs(combined_invalid_stream, topic)
-    
-    # Stream 2: Processed valid data to Kafka
+    audit_query = write_invalid_to_console(combined_invalid_stream, topic)
     kafka_query = write_processed_to_kafka(processed_valid_stream, processed_topic, f"{topic}_processed")
     
-    # Stream 3: Processed valid data to HBase
-    hbase_query = processed_valid_stream.writeStream \
-        .foreachBatch(lambda batch_df, batch_id: write_transactions_to_hbase(batch_df, batch_id)) \
-        .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_hbase") \
+    mongodb_query = processed_valid_stream.writeStream \
+        .foreachBatch(lambda batch_df, batch_id: write_transactions_to_mongodb(batch_df, batch_id)) \
+        .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_mongodb") \
         .trigger(processingTime='10 seconds') \
         .start()
     
     print(f"✓ Three-stream processing started for {topic}")
-    return [audit_query, kafka_query, hbase_query]
+    return [audit_query, kafka_query, mongodb_query]
+
 
 def process_sessions(spark):
-    """
-    Process session stream with three-way split:
-    1. Invalid records -> HDFS audit (validation rejections, processing generates IDs)
-    2. Valid records -> Process -> Kafka
-    3. Valid records -> Process -> HBase
-    """
+    """Process session stream with three-way split."""
     topic = TOPICS['sessions']
     processed_topic = PROCESSED_TOPICS['sessions']
     
-    # Read from Kafka
     raw_stream = read_kafka_stream(spark, topic)
     
-    # Parse JSON using Spark operations
     session_schema = get_session_schema()
     parsed_stream = raw_stream \
         .selectExpr("CAST(value AS STRING) as json_value") \
         .select(from_json(col("json_value"), session_schema).alias("data")) \
         .select("data.*")
     
-    # Initial validation (session_id checked/generated in processing)
     validation_stream = parsed_stream.withColumn(
         "is_valid",
         when(
@@ -541,233 +682,26 @@ def process_sessions(spark):
         .otherwise(lit(None))
     )
     
-    # Split: validation invalid records
     validation_invalid_stream = validation_stream.filter(col("is_valid") == False)
-    
-    # Valid records for processing
     valid_stream = validation_stream.filter(col("is_valid") == True).drop("is_valid", "rejection_reason")
     
-    # Apply processing (handles session_id generation)
     processed_valid_stream, processing_invalid_stream = process_sessions_data(valid_stream)
     
-    # Merge validation and processing invalids (processing_invalid will be empty for sessions)
     processing_invalid_renamed = processing_invalid_stream.withColumnRenamed("processing_rejection_reason", "rejection_reason")
     combined_invalid_stream = validation_invalid_stream.unionByName(processing_invalid_renamed, allowMissingColumns=True)
     
-    # Stream 1: Combined invalid records to HDFS audit
-    audit_query = write_invalid_to_hdfs(combined_invalid_stream, topic)
-    
-    # Stream 2: Processed valid data to Kafka
+    audit_query = write_invalid_to_console(combined_invalid_stream, topic)
     kafka_query = write_processed_to_kafka(processed_valid_stream, processed_topic, f"{topic}_processed")
     
-    # Stream 3: Processed valid data to HBase
-    hbase_query = processed_valid_stream.writeStream \
-        .foreachBatch(lambda batch_df, batch_id: write_sessions_to_hbase(batch_df, batch_id)) \
-        .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_hbase") \
+    mongodb_query = processed_valid_stream.writeStream \
+        .foreachBatch(lambda batch_df, batch_id: write_sessions_to_mongodb(batch_df, batch_id)) \
+        .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_mongodb") \
         .trigger(processingTime='10 seconds') \
         .start()
     
     print(f"✓ Three-stream processing started for {topic}")
-    return [audit_query, kafka_query, hbase_query]
+    return [audit_query, kafka_query, mongodb_query]
 
-# HBase write functions
-def get_hbase_connection():
-    """Get HBase connection."""
-    return happybase.Connection(
-            host=HBASE_HOST, 
-            port=HBASE_PORT
-        )
-def write_users_to_hbase(batch_df, batch_id):
-    """Write user batch to HBase dim_users table."""
-    if batch_df.isEmpty():
-        return
-    
-    print(f"Writing users batch {batch_id} with {batch_df.count()} records to HBase...")
-    
-    try:
-        connection = get_hbase_connection()
-        table = connection.table('dim_users')
-        
-        with table.batch(batch_size=1000) as batch:
-            for row in batch_df.collect():
-                if row.user_id:
-                    batch.put(
-                        row.user_id.encode(),
-                        {
-                            b'profile:email': str(row.email).encode() if row.email else b'',
-                            b'profile:age': str(row.age).encode() if row.age else b'',
-                            b'profile:country': str(row.country).encode() if row.country else b'',
-                            b'profile:registration_date': str(row.registeration_date).encode() if row.registeration_date else b''
-                        }
-                    )
-        
-        connection.close()
-        print(f"✓ Batch {batch_id}: Written {batch_df.count()} users to HBase")
-    except Exception as e:
-        print(f"✗ Error writing users batch {batch_id}: {e}")
-
-def write_products_to_hbase(batch_df, batch_id):
-    """Write product batch to HBase dim_products table."""
-    if batch_df.isEmpty():
-        return
-    
-    print(f"Writing products batch {batch_id} with {batch_df.count()} records to HBase...")
-    
-    try:
-        connection = get_hbase_connection()
-        table = connection.table('dim_products')
-        
-        with table.batch(batch_size=1000) as batch:
-            for row in batch_df.collect():
-                if row.product_id:
-                    batch.put(
-                        row.product_id.encode(),
-                        {
-                            b'details:name': str(row.name).encode() if row.name else b'',
-                            b'details:category': str(row.category).encode() if row.category else b'',
-                            b'details:price': str(row.price).encode() if row.price else b'',
-                            b'details:inventory': str(row.inventory).encode() if row.inventory else b'',
-                            b'details:ratings': str(row.ratings).encode() if row.ratings else b''
-                        }
-                    )
-        
-        connection.close()
-        print(f"✓ Batch {batch_id}: Written {batch_df.count()} products to HBase")
-    except Exception as e:
-        print(f"✗ Error writing products batch {batch_id}: {e}")
-
-def generate_time_id(timestamp_str):
-    """Generate time_id in format YYYYMMDD_HH from timestamp string."""
-    try:
-        dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-        return dt.strftime('%Y%m%d_%H')
-    except:
-        dt = datetime.now()
-        return dt.strftime('%Y%m%d_%H')
-
-def write_time_dimension(timestamp_str, connection):
-    """Write to dim_time table if not exists."""
-    time_id = generate_time_id(timestamp_str)
-    
-    try:
-        dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-    except:
-        dt = datetime.now()
-    
-    table = connection.table('dim_time')
-    
-    # Check if time_id already exists
-    try:
-        existing = table.row(time_id.encode())
-        if existing:
-            return time_id  # Already exists
-    except:
-        pass
-    
-    # Insert new time dimension
-    table.put(
-        time_id.encode(),
-        {
-            b'temporal:year': str(dt.year).encode(),
-            b'temporal:month': str(dt.month).encode(),
-            b'temporal:day': str(dt.day).encode(),
-            b'temporal:hour': str(dt.hour).encode(),
-            b'temporal:day_of_week': dt.strftime('%A').encode(),
-            b'temporal:quarter': str((dt.month - 1) // 3 + 1).encode()
-        }
-    )
-    
-    return time_id
-
-def write_transactions_to_hbase(batch_df, batch_id):
-    """Write transaction batch to HBase fact_transactions table."""
-    if batch_df.isEmpty():
-        return
-    
-    print(f"Writing transactions batch {batch_id} with {batch_df.count()} records to HBase...")
-    
-    try:
-        connection = get_hbase_connection()
-        table = connection.table('fact_transactions')
-        
-        with table.batch(batch_size=1000) as batch:
-            for row in batch_df.collect():
-                if row.transaction_id and row.products:
-                    # Calculate metrics
-                    total_amount = sum(p.price * p.quantity for p in row.products if p.price and p.quantity)
-                    num_products = len(row.products)
-                    
-                    # Generate time_id and populate dim_time
-                    time_id = write_time_dimension(row.timestamp, connection)
-                    
-                    # Prepare HBase row
-                    hbase_data = {
-                        b'metrics:total_amount': str(total_amount).encode(),
-                        b'metrics:num_products': str(num_products).encode(),
-                        b'metrics:timestamp': str(row.timestamp).encode(),
-                        b'refs:user_id': str(row.user_id).encode(),
-                        b'refs:time_id': time_id.encode(),
-                        b'refs:payment_method': str(row.payment_method).encode() if row.payment_method else b''
-                    }
-                    
-                    # Add product details
-                    for idx, product in enumerate(row.products):
-                        if product.product_id:
-                            hbase_data[f'products:product_{idx}_id'.encode()] = product.product_id.encode()
-                            hbase_data[f'products:product_{idx}_quantity'.encode()] = str(product.quantity).encode() if product.quantity else b'0'
-                            hbase_data[f'products:product_{idx}_price'.encode()] = str(product.price).encode() if product.price else b'0'
-                    
-                    batch.put(row.transaction_id.encode(), hbase_data)
-        
-        connection.close()
-        print(f"✓ Batch {batch_id}: Written {batch_df.count()} transactions to HBase")
-    except Exception as e:
-        print(f"✗ Error writing transactions batch {batch_id}: {e}")
-
-def write_sessions_to_hbase(batch_df, batch_id):
-    """Write session batch to HBase fact_sessions table."""
-    if batch_df.isEmpty():
-        return
-    
-    print(f"Writing sessions batch {batch_id} with {batch_df.count()} records to HBase...")
-    
-    try:
-        connection = get_hbase_connection()
-        table = connection.table('fact_sessions')
-        
-        with table.batch(batch_size=1000) as batch:
-            for row in batch_df.collect():
-                if row.session_id and row.events:
-                    # Calculate metrics
-                    num_events = len(row.events)
-                    
-                    # Calculate session duration (simplified - using event count as proxy)
-                    session_duration = num_events * 10  # Estimate 10 seconds per event
-                    
-                    # Generate time_id and populate dim_time
-                    time_id = write_time_dimension(row.timestamp, connection)
-                    
-                    # Prepare HBase row
-                    hbase_data = {
-                        b'metrics:num_events': str(num_events).encode(),
-                        b'metrics:session_duration': str(session_duration).encode(),
-                        b'metrics:timestamp': str(row.timestamp).encode(),
-                        b'refs:user_id': str(row.user_id).encode(),
-                        b'refs:time_id': time_id.encode()
-                    }
-                    
-                    # Add event details
-                    for idx, event in enumerate(row.events):
-                        if event.eventType:
-                            hbase_data[f'events:event_{idx}_type'.encode()] = event.eventType.encode()
-                            hbase_data[f'events:event_{idx}_timestamp'.encode()] = str(event.timestamp).encode() if event.timestamp else b''
-                    
-                    batch.put(row.session_id.encode(), hbase_data)
-        
-        connection.close()
-        print(f"✓ Batch {batch_id}: Written {batch_df.count()} sessions to HBase")
-    except Exception as e:
-        print(f"✗ Error writing sessions batch {batch_id}: {e}")
 
 def main():
     """Main execution function."""
@@ -777,9 +711,9 @@ def main():
     print(f"Start time: {datetime.now().isoformat()}")
     print(f"\nConfiguration:")
     print(f"  Kafka Brokers: {KAFKA_BROKERS}")
-    print(f"  HDFS Namenode: {HDFS_NAMENODE}")
-    print(f"  HDFS Audit Path: {HDFS_AUDIT_PATH}")
-    print(f"  HBase Host: {HBASE_HOST}:{HBASE_PORT}")
+    print(f"  MongoDB URI: {MONGODB_URI}")
+    print(f"  MongoDB Database: {MONGODB_DATABASE}")
+    print(f"  Checkpoint Path: {CHECKPOINT_PATH}")
     print(f"\nSource Topics:")
     for key, topic in TOPICS.items():
         print(f"  {key}: {topic}")
@@ -805,8 +739,7 @@ def main():
     print(f"\n✓ All {len(queries)} streaming queries started successfully!")
     print("\nMonitoring:")
     print("  - Spark UI: http://localhost:4041")
-    print("  - HDFS UI: http://localhost:9870")
-    print("  - HBase UI: http://localhost:16010")
+    print("  - MongoDB: mongodb://localhost:27017")
     print("\nPress Ctrl+C to stop the pipeline...")
     
     # Wait for termination
@@ -820,6 +753,7 @@ def main():
         print("✓ All queries stopped")
         spark.stop()
         print("✓ Spark session closed")
+
 
 if __name__ == "__main__":
     main()

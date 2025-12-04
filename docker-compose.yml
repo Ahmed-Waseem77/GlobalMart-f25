@@ -87,12 +87,13 @@ services:
         ipv4_address: 172.25.0.15
 
   grafana:
-    image: grafana/grafana:6.1.1
+    image: grafana/grafana-enterprise:12.3.0
     container_name: grafana
     expose:
       - "3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=password
+      - GF_PLUGINS_PREINSTALL_SYNC=grafana-mongodb-datasource
     volumes:
       - ./grafana/provisioning/:/etc/grafana/provisioning/
     depends_on:
@@ -150,112 +151,95 @@ services:
     networks:
       - kafkanet
 
-  namenode:
-    image: apache/hadoop:3
-    container_name: namenode
-    command: ["hdfs", "namenode"]
+  # ==================== MongoDB Replica Set ====================
+  # 3-node replica set for high availability and horizontal scaling
+  # To scale: add more mongoN services following the same pattern
+  
+  mongo1:
+    image: mongo:7.0
+    container_name: mongo1
+    hostname: mongo1
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
+    ports:
+      - "27017:27017"
+    expose:
+      - "27017"
     volumes:
-      - ./namenode:/hadoop/dfs/name
-    env_file:
-      - ./hadoop_config/config
-    environment: 
-      ENSURE_NAMENODE_DIR: "/tmp/hadoop-root/dfs/name"
-      HDFS-SITE.XML_dfs.namenode.rpc-address: "0.0.0.0:8020"
-    expose:
-      - "9870"
-      - "8020"
-    ports:
-      - "9870:9870"
+      - mongo1_data:/data/db
+      - mongo1_config:/data/configdb
     networks:
       kafkanet:
-        ipv4_address: 172.25.0.22
+        ipv4_address: 172.25.0.30
     healthcheck:
-      test: ["CMD", "sh", "-c", "curl -f http://localhost:9870/"]
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
-      timeout: 10s
-      retries: 15
-      start_period: 90s
-    depends_on:
-      - zookeeper
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
-  datanode:
-    image: apache/hadoop:3
-    container_name: datanode
-    command: ["hdfs", "datanode"]
-    env_file:
-      - ./hadoop_config/config
-    depends_on:
-      namenode:
-        condition: service_healthy
+  mongo2:
+    image: mongo:7.0
+    container_name: mongo2
+    hostname: mongo2
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
+    expose:
+      - "27017"
+    volumes:
+      - mongo2_data:/data/db
+      - mongo2_config:/data/configdb
     networks:
       kafkanet:
-        ipv4_address: 172.25.0.23
+        ipv4_address: 172.25.0.31
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
-
-  hbase-master:
-    image: bde2020/hbase-master:1.0.0-hbase1.2.6
-    container_name: hbase-master
-    hostname: hbase-master
-    environment:
-      - HBASE_CONF_hbase_rootdir=hdfs://namenode:8020/hbase
-      - HBASE_CONF_hbase_zookeeper_quorum=zookeeper
-      - HBASE_CONF_hbase_zookeeper_property_clientPort=2181
-      - HBASE_CONF_hbase_zookeeper_property_dataDir=/zookeeper
-      - HBASE_MANAGES_ZK=false
+  mongo3:
+    image: mongo:7.0
+    container_name: mongo3
+    hostname: mongo3
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
     expose:
-      - "16000"
-      - "16010"
-    ports:
-      - "16010:16010"
-    depends_on:
-      namenode:
-        condition: service_healthy
-      zookeeper:
-        condition: service_started
+      - "27017"
+    volumes:
+      - mongo3_data:/data/db
+      - mongo3_config:/data/configdb
     networks:
       kafkanet:
-        ipv4_address: 172.25.0.24
+        ipv4_address: 172.25.0.32
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
-  hbase-regionserver:
-    image: bde2020/hbase-regionserver:1.0.0-hbase1.2.6
-    container_name: hbase-regionserver
-    hostname: hbase-regionserver
-    environment:
-      - HBASE_CONF_hbase_rootdir=hdfs://namenode:8020/hbase
-      - HBASE_CONF_hbase_zookeeper_quorum=zookeeper
-      - HBASE_CONF_hbase_zookeeper_property_clientPort=2181
-      - HBASE_CONF_hbase_zookeeper_property_dataDir=/zookeeper
-      - HBASE_CONF_hbase_master=hbase-master:16000
-      - HBASE_MANAGES_ZK=false
-    expose:
-      - "16020"
-      - "16030"
+  mongo-init:
+    image: mongo:7.0
+    container_name: mongo-init
+    restart: "no"
     depends_on:
-      - hbase-master
+      mongo1:
+        condition: service_healthy
+      mongo2:
+        condition: service_healthy
+      mongo3:
+        condition: service_healthy
+    command: >
+      mongosh --host mongo1:27017 --eval '
+      rs.initiate({
+        _id: "rs0",
+        members: [
+          { _id: 0, host: "mongo1:27017", priority: 2 },
+          { _id: 1, host: "mongo2:27017", priority: 1 },
+          { _id: 2, host: "mongo3:27017", priority: 1 }
+        ]
+      })'
     networks:
       - kafkanet
-
-  hbase-thrift:
-    image: bde2020/hbase-master:1.0.0-hbase1.2.6
-    container_name: hbase-thrift
-    hostname: hbase-thrift
-    command: /opt/hbase-1.2.6/bin/hbase thrift start -p 9091
-    environment:
-      - HBASE_CONF_hbase_rootdir=hdfs://namenode:8020/hbase
-      - HBASE_CONF_hbase_zookeeper_quorum=zookeeper
-      - HBASE_CONF_hbase_zookeeper_property_clientPort=2181
-      - HBASE_CONF_hbase_zookeeper_property_dataDir=/zookeeper
-      - HBASE_MANAGES_ZK=false
-    expose:
-      - "9091"
-    ports:
-      - "9095:9091"
-    depends_on:
-      - hbase-master
-      - hbase-regionserver
-    networks:
-      kafkanet:
-        ipv4_address: 172.25.0.25
 
 networks:
   kafkanet:
@@ -271,6 +255,9 @@ volumes:
   kafka_zookeeper:
   kafka_kafka1:
   kafka_kafka2:
-  namenode:
-  datanode:
-
+  mongo1_data:
+  mongo1_config:
+  mongo2_data:
+  mongo2_config:
+  mongo3_data:
+  mongo3_config:
