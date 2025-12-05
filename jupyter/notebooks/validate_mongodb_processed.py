@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-MongoDB Data Validation Script for GlobalMart Star Schema
+MongoDB Data Validation Script for GlobalMart Star Schema & Audit
 
-This script connects to MongoDB and prints a sample of documents
-from each collection in the star schema to verify data was loaded correctly.
+This script connects to MongoDB and validates:
+1. Dimension Tables (Users, Products, Time)
+2. Fact Tables (Transactions, Sessions)
+3. Audit Table (Anomalies/Dead Letter Queue)
 
 Usage:
     python validate_mongodb_processed.py
@@ -25,7 +27,9 @@ COLLECTIONS = [
     "dim_time",
     # Fact tables
     "fact_transactions",
-    "fact_sessions"
+    "fact_sessions",
+    # Audit table (The new addition)
+    "audit_anomalies"
 ]
 
 SAMPLE_SIZE = 3  # Number of documents to show per collection
@@ -45,6 +49,9 @@ def format_document(doc):
     for key, value in doc.items():
         if isinstance(value, list):
             formatted[key] = [convert(v) if not isinstance(v, dict) else v for v in value]
+        elif isinstance(value, dict):
+            # Recursively handle nested dictionaries (like raw_data)
+            formatted[key] = json.loads(format_document(value)) 
         else:
             formatted[key] = convert(value)
     
@@ -70,7 +77,12 @@ def validate_collection(db, collection_name):
         print(f"\nSample documents (up to {SAMPLE_SIZE}):")
         print("-" * 40)
         
-        for i, doc in enumerate(collection.find().limit(SAMPLE_SIZE), 1):
+        # Sort by latest insertion (if timestamp exists) or natural order
+        cursor = collection.find().limit(SAMPLE_SIZE)
+        if collection_name == 'audit_anomalies':
+             cursor = collection.find().sort("detected_at", -1).limit(SAMPLE_SIZE)
+
+        for i, doc in enumerate(cursor, 1):
             print(f"\n[Document {i}]")
             print(format_document(doc))
             
@@ -98,6 +110,37 @@ def print_collection_stats(db):
     
     print("-"*40)
     print(f"  {'Total':<23} {total:>15,}")
+
+
+def print_audit_analysis(db):
+    """Special analysis for the Audit table to verify Anomaly Logic."""
+    print("\n" + "="*60)
+    print("🕵️  Anomaly Detection Analysis (Audit Table)")
+    print("="*60)
+    
+    try:
+        coll = db["audit_anomalies"]
+        if coll.count_documents({}) == 0:
+            print("No anomalies detected yet.")
+            return
+
+        # Group by Source Collection
+        print("\nAnomalies by Source:")
+        pipeline_source = [{"$group": {"_id": "$source_collection", "count": {"$sum": 1}}}]
+        for doc in coll.aggregate(pipeline_source):
+            print(f"  - {doc['_id']}: {doc['count']}")
+
+        # Group by Description (Reason)
+        print("\nTop Rejection Reasons:")
+        pipeline_reason = [
+            {"$group": {"_id": "$description", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}}
+        ]
+        for doc in coll.aggregate(pipeline_reason):
+            print(f"  - {doc['_id']}: {doc['count']}")
+
+    except Exception as e:
+        print(f"Error analyzing anomalies: {e}")
 
 
 def main():
@@ -136,6 +179,9 @@ def main():
     # Validate each collection
     for collection_name in COLLECTIONS:
         validate_collection(db, collection_name)
+
+    # Print Specific Audit Analysis
+    print_audit_analysis(db)
     
     # Close connection
     client.close()

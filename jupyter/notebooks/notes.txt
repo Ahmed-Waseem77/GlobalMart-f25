@@ -1,0 +1,401 @@
+                                               Anomolies
+Anomaly Configuration: Added ANOMALY_RATE = 0.05 to control frequency.
+
+Product Anomalies (Inventory/Stock): Added logic to generate negative_price, negative_inventory, or 0 inventory (Low Stock Alerts).
+
+Transaction Anomalies (Fraud/Outliers): Added logic to generate abnormally high quantities (e.g., 50-1000 units) or price spikes.
+
+Session Anomalies (Bot Detection): Added logic to generate sessions with an impossible number of events (50-200) to simulate bots.
+
+User Anomalies (Data Integrity): Added logic for registration dates in the future.
+
+- > Based on the logic in the spark_elt_flow.py script I provided, the anomalies are strictly isolated.
+
+- > They are thrown into the audit table ONLY. They are NOT inserted into your main dimension or fact tables.
+
+                                                Queries
+[
+  {
+    "$group": {
+      "_id": null,
+      "Total_Revenue": { "$sum": "$total_amount" },
+      "Total_Transactions": { "$sum": 1 },
+      "Avg_Order_Value": { "$avg": "$total_amount" }
+    }
+  }
+]
+------------------------------------------------------
+Total Transactions
+[
+  {
+    "$group": {
+      "_id": null,
+      "Total_Revenue": { "$sum": "$total_amount" },
+      "Total_Transactions": { "$sum": 1 },
+      "Avg_Order_Value": { "$avg": "$total_amount" }
+    }
+  }
+]
+------------------------------------
+Average Order Value
+[
+  {
+    "$group": {
+      "_id": null,
+      "Total_Revenue": { "$sum": "$total_amount" },
+      "Total_Transactions": { "$sum": 1 },
+      "Avg_Order_Value": { "$avg": "$total_amount" }
+    }
+  }
+]
+------------------------------------
+Peak Sales Hour
+[
+  {
+    "$group": {
+      "_id": { "$hour": { "$toDate": "$timestamp" } },
+      "total_revenue": { "$sum": "$total_amount" }
+    }
+  },
+  { "$sort": { "total_revenue": -1 } },
+  { "$limit": 1 },
+  { 
+    "$project": { 
+      "_id": 0, 
+      "peak_hour": "$_id" 
+    } 
+  }
+]
+--------------------------------------------
+Geographic sales distribution
+
+[
+  {
+    "$lookup": {
+      "from": "fact_transactions",
+      "localField": "user_id",
+      "foreignField": "user_id",
+      "as": "user_txns"
+    }
+  },
+  { "$unwind": "$user_txns" },
+  {
+    "$group": {
+      "_id": "$country",
+      "total_sales": { "$sum": "$user_txns.total_amount" },
+      "user_count": { "$sum": 1 }
+    }
+  },
+  { "$sort": { "total_sales": -1 } }
+]
+----------------------------------------------------
+Global Customers Distribution
+[
+  {
+    "$lookup": {
+      "from": "dim_users",
+      "localField": "user_id",
+      "foreignField": "user_id",
+      "as": "user_info"
+    }
+  },
+  { "$unwind": "$user_info" },
+  {
+    "$group": {
+      "_id": "$user_info.country",
+      "total_sales": { "$sum": "$total_amount" },
+      "transaction_count": { "$sum": 1 }
+    }
+  },
+  { "$sort": { "total_sales": -1 } },
+]
+--------------------------------------------------
+Product category performance
+
+[
+  { "$unwind": "$products" },
+  {
+    "$lookup": {
+      "from": "dim_products",
+      "localField": "products.product_id",
+      "foreignField": "product_id",
+      "as": "product_details"
+    }
+  },
+  { "$unwind": "$product_details" },
+  {
+    "$group": {
+      "_id": "$product_details.category",
+      "total_revenue": { "$sum": { "$multiply": ["$products.quantity", "$products.price"] } },
+      "units_sold": { "$sum": "$products.quantity" }
+    }
+  },
+  { "$sort": { "total_revenue": -1 } }
+]
+
+--------------------------------------------
+Top 10 Selling Products
+
+[
+  { "$unwind": "$products" },
+  {
+    "$lookup": {
+      "from": "dim_products",
+      "localField": "products.product_id",
+      "foreignField": "product_id",
+      "as": "details"
+    }
+  },
+  { "$unwind": "$details" },
+  {
+    "$group": {
+      "_id": "$details.name",
+      "revenue": { "$sum": { "$multiply": ["$products.quantity", "$products.price"] } },
+      "quantity_sold": { "$sum": "$products.quantity" }
+    }
+  },
+  { "$sort": { "revenue": -1 } },
+  { "$limit": 10 }
+]
+
+-------------------------------
+Top 10 Highest Rated Products
+
+[
+  { 
+    "$match": { "rating": { "$ne": null } } 
+  },
+  { "$sort": { "rating": -1, "price": -1 } },
+  { "$limit": 10 },
+  {
+    "$project": {
+      "_id": 0,
+      "Product": "$name",
+      "Category": "$category",
+      "Rating": "$rating",
+      "Price": "$price"
+    }
+  }
+]
+------------------------------------
+Segment Distribution
+
+[
+  {
+    "$group": {
+      "_id": "$user_id",
+      "recency_date": { "$max": "$timestamp" },
+      "frequency": { "$sum": 1 },
+      "monetary": { "$sum": "$total_amount" }
+    }
+  },
+  {
+    "$project": {
+      "days_since_last_purchase": {
+        "$divide": [
+          { "$subtract": [new Date(), { "$toDate": "$recency_date" }] },
+          86400000
+        ]
+      },
+      "frequency": 1,
+      "monetary": 1
+    }
+  },
+  {
+    "$project": {
+      "segment": {
+        "$switch": {
+          "branches": [
+            { 
+              "case": { 
+                "$and": [ 
+                  { "$lte": ["$days_since_last_purchase", 30] }, 
+                  { "$gte": ["$frequency", 20] } 
+                ] 
+              }, 
+              "then": "Champions 🏆" 
+            },
+            { 
+              "case": { 
+                "$and": [ 
+                  { "$gte": ["$days_since_last_purchase", 60] }, 
+                  { "$gte": ["$monetary", 5000] } 
+                ] 
+              }, 
+              "then": "At Risk (High Value) ⚠️" 
+            },
+             { 
+              "case": { "$gte": ["$frequency", 10] }, 
+              "then": "Loyal Customers 💚" 
+            }
+          ],
+          "default": "New / Low Engagement 💤"
+        }
+      },
+      "monetary": 1
+    }
+  },
+  {
+    "$group": {
+      "_id": "$segment",
+      "count": { "$sum": 1 },
+      "avg_spend": { "$avg": "$monetary" }
+    }
+  },
+  { "$sort": { "count": -1 } }
+]
+
+#Champions 🏆: Bought recently (< 30 days) AND buy often (> 20 times).
+
+#Loyal Customers 💚: Good frequency but haven't bought in the last month.
+
+#At Risk ⚠️: Haven't bought in a long time (> 60 days) but used to spend money.
+
+#New / Low Value 💤: Everyone else.
+------------------------------------------------
+Customer Demographics (Age Group)
+[
+  {
+    "$project": {
+      "age_group": {
+        "$switch": {
+          "branches": [
+            { "case": { "$lt": ["$age", 25] }, "then": "18-24" },
+            { "case": { "$lt": ["$age", 35] }, "then": "25-34" },
+            { "case": { "$lt": ["$age", 45] }, "then": "35-44" },
+            { "case": { "$lt": ["$age", 55] }, "then": "45-54" }
+          ],
+          "default": "55+"
+        }
+      }
+    }
+  },
+  {
+    "$group": {
+      "_id": "$age_group",
+      "count": { "$sum": 1 }
+    }
+  },
+  { "$sort": { "_id": 1 } }
+]
+----------------------------------------------------------
+Niche Customers
+
+[
+  {
+    "$group": {
+      "_id": "$user_id",
+      "lifetime_spend": { "$sum": "$total_amount" },
+      "orders": { "$sum": 1 },
+      "last_purchase": { "$max": "$timestamp" }
+    }
+  },
+  { "$sort": { "lifetime_spend": -1 } },
+  { "$limit": 10 },
+  {
+    "$lookup": {
+      "from": "dim_users",
+      "localField": "_id",
+      "foreignField": "user_id",
+      "as": "info"
+    }
+  },
+  { "$unwind": "$info" },
+  {
+    "$project": {
+      "User Email": "$info.email",
+      "Country": "$info.country",
+      "Total Spend": "$lifetime_spend",
+      "Orders": "$orders"
+    }
+  }
+]
+------------------------------------------------------------------------
+Total Inventory Value
+[
+  {
+    "$group": {
+      "_id": null,
+      "total_inventory_value": { "$sum": { "$multiply": ["$price", "$inventory"] } }
+    }
+  }
+]
+----------------------------------------------------
+Highest Inventory Category
+[
+  {
+    "$group": {
+      "_id": "$category",
+      "total_items": { "$sum": "$inventory" }
+    }
+  },
+  { "$sort": { "total_items": -1 } },
+  { "$limit": 1 },
+  {
+    "$project": {
+      "_id": 0,
+      "Category": "$_id",
+      "Count": "$total_items"
+    }
+  }
+]
+-----------------------------------------------------------------
+Lowest Inventory Category
+[
+  {
+    "$group": {
+      "_id": "$category",
+      "total_items": { "$sum": "$inventory" }
+    }
+  },
+  { "$sort": { "total_items": 1 } },
+  { "$limit": 1 },
+  {
+    "$project": {
+      "_id": 0,
+      "Category": "$_id",
+      "Count": "$total_items"
+    }
+  }
+]
+---------------------------------------------------------
+No. of Products With Critical Stock Level
+[
+  {
+    "$match": {
+      "inventory": { "$lt": 20 }
+    }
+  },
+  {
+    "$count": "Products at Critical Stock"
+  }
+]
+# This query simply counts the total number of products whose inventory is below your defined threshold
+----------------------------------------------------------------------
+Critical Low Stock Inventory
+[
+  {
+    "$match": {
+      "inventory": { "$lt": 20 }
+    }
+  },
+  {
+    "$project": {
+      "_id": 0,
+      "Product": "$name",
+      "Category": "$category",
+      "Stock_Level": "$inventory"
+    }
+  },
+  { "$sort": { "Stock_Level": 1 } }
+]
+
+
+
+Missing:
+sales trend
+cart abondment detection
+sales metrics agrregation (hour / category / region)
+api 
+data flow
+data validation

@@ -11,7 +11,7 @@ services:
         ipv4_address: 172.25.0.11
 
   kafka1:
-    image: wurstmeister/kafka:2.12-2.2.0
+    image: wurstmeister/kafka:latest
     container_name: kafka1
     command: [start-kafka.sh]
     expose:
@@ -32,7 +32,7 @@ services:
       - "zookeeper"
 
   kafka2:
-    image: wurstmeister/kafka:2.12-2.2.0
+    image: wurstmeister/kafka:latest
     container_name: kafka2
     command: [start-kafka.sh]
     expose:
@@ -60,7 +60,7 @@ services:
     environment:
       ZK_HOSTS: "172.25.0.11:2181"
       APPLICATION_SECRET: "random-secret"
-    command: -Dpidfile.path=/dev/null
+    command: -Dpidfile.path=/dev/null -Dapplication.home=. 
     depends_on:
       - "zookeeper"
       - "kafka1"
