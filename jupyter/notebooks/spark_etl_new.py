@@ -2,27 +2,27 @@
 """
 Spark Streaming ELT Pipeline for GlobalMart
 
-This pipeline implements a three-stream data flow:
+This pipeline implements a multi-stream data flow:
 1. Extract: Read streaming data from Kafka topics
 2. Transform: Parse JSON and validate data using Spark DataFrame operations
-3. Load (Three streams):
-   a. Invalid/Anomalous data -> MongoDB 'audit_anomalies' collection
-   b. Valid data -> Process (stub) -> Kafka processed topics
-   c. Valid data -> Process (stub) -> MongoDB star schema (via PyMongo)
+3. Load:
+   a. Invalid data -> MongoDB 'audit_anomalies'
+   b. Valid data -> Processed Kafka topics
+   c. Valid data -> MongoDB star schema
+   d. Analytics data -> 'realtime_analytics' Kafka topic (Transactions only)
 
 Usage:
-    spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0 spark_elt_flow.py
+    spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 spark_elt_flow.py
 """
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, from_json, to_json, struct, current_timestamp, 
-    date_format, year, month, dayofmonth, hour, dayofweek, quarter,
-    size, when, lit, concat_ws, concat, lpad, udf, expr, to_date
+    size, when, lit, udf, expr
 )
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, 
-    FloatType, ArrayType, TimestampType, DoubleType
+    FloatType, ArrayType
 )
 from pymongo import MongoClient
 from pymongo.errors import BulkWriteError
@@ -52,21 +52,19 @@ PROCESSED_TOPICS = {
     'sessions': 'processed_sessions'
 }
 
-# Local checkpoint path
+# New Analytics Topic
+ANALYTICS_TOPIC = 'realtime_analytics'
+
+# Checkpoint path (Using a mounted volume path if available, or /tmp)
+# If running in Docker/Jupyter, ensure this path is persistent or cleared on restart
 CHECKPOINT_PATH = "/tmp/spark_checkpoints"
 
 
 def create_spark_session():
     """Create and configure Spark session."""
-    
-    # -----------------------------------------------------------------------
-    # ⚠️ STEP 1: CHANGE THIS TO MATCH THE OUTPUT OF 'spark-submit --version'
-    # Common versions: "3.5.1", "3.5.0", "3.4.1"
-    # -----------------------------------------------------------------------
     SPARK_VERSION = "3.5.1"  
     SCALA_VERSION = "2.12"   
     
-    # Define the package coordinates based on the version
     KAFKA_PACKAGE = f"org.apache.spark:spark-sql-kafka-0-10_{SCALA_VERSION}:{SPARK_VERSION}"
     
     print(f"--- Spark Configuration ---")
@@ -127,6 +125,7 @@ def get_transaction_schema():
 def get_session_event_schema():
     return StructType([
         StructField("eventType", StringType(), True),
+        StructField("product_id", StringType(), True), 
         StructField("timestamp", StringType(), True)
     ])
 
@@ -157,7 +156,6 @@ def get_mongodb_client():
     return MongoClient(MONGODB_URI)
 
 def generate_time_id_from_str(timestamp_str):
-    """Generate time_id in format YYYYMMDDHH from timestamp string."""
     try:
         dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
         return dt.strftime('%Y%m%d%H')
@@ -166,14 +164,12 @@ def generate_time_id_from_str(timestamp_str):
         return dt.strftime('%Y%m%d%H')
 
 def upsert_time_dimension(db, timestamp_str):
-    """Helper to upsert time dimension within a partition."""
     time_id = generate_time_id_from_str(timestamp_str)
     try:
         dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
     except:
         dt = datetime.now()
     
-    # We use update_one with upsert=True to avoid duplicates
     db["dim_time"].update_one(
         {"time_id": time_id},
         {"$setOnInsert": {
@@ -186,13 +182,13 @@ def upsert_time_dimension(db, timestamp_str):
     return time_id
 
 
-# --- Validation Logic (Anomalies & Integrity) ---
+# --- Validation & Transformation Logic ---
 
 def process_users_data(df):
     processed_df = df.withColumn(
         "processing_valid",
         when(col("email").isNull(), lit(False))
-        .when(col("registeration_date") > current_timestamp(), lit(False)) # Future Date Anomaly
+        .when(col("registeration_date") > current_timestamp(), lit(False))
         .otherwise(lit(True))
     ).withColumn(
         "processing_rejection_reason",
@@ -215,10 +211,7 @@ def process_products_data(df):
         when(col("ratings") < 0, lit(0.0)).otherwise(col("ratings"))
     ).withColumn(
         "processing_valid",
-        when(
-            (col("price") < 0) | (col("inventory") < 0),
-            lit(False)
-        ).otherwise(lit(True))
+        when((col("price") < 0) | (col("inventory") < 0), lit(False)).otherwise(lit(True))
     ).withColumn(
         "processing_rejection_reason",
         when(col("price") < 0, lit("Data Quality: Negative price detected"))
@@ -232,10 +225,22 @@ def process_products_data(df):
     return (valid_df, invalid_df)
 
 def process_transactions_data(df):
-    # Check if any product in the array has quantity > 50
+    # 1. Calculate Total Amount
+    # Using Spark SQL High-order functions to sum (price * quantity) for the array
+    processed_df = df.withColumn(
+        "total_amount",
+        expr("""
+           aggregate(
+               transform(products, x -> coalesce(x.quantity, 0) * coalesce(x.price, 0.0)),
+               0.0D,
+               (acc, x) -> acc + x
+           )
+        """)
+    )
+
     has_bulk_items = expr("exists(products, x -> x.quantity > 50)")
     
-    processed_df = df.withColumn(
+    processed_df = processed_df.withColumn(
         "processing_valid",
         when(col("payment_method") == "Unknown_Method", lit(False))
         .when(has_bulk_items, lit(False))
@@ -273,7 +278,7 @@ def process_sessions_data(df):
     return (valid_df, invalid_df)
 
 
-# ==================== Partition Writers (Worker Side) ====================
+# ==================== MongoDB Writers ====================
 
 def write_users_partition(iterator):
     client = get_mongodb_client()
@@ -326,14 +331,17 @@ def write_transactions_partition(iterator):
     batch = []
     try:
         for row in iterator:
-            total_amount = sum([(p.price or 0) * (p.quantity or 0) for p in (row.products or [])])
+            # USE PRE-CALCULATED COLUMN FROM SPARK
+            total_amount = row.total_amount
+            
             products_list = [{"product_id": p.product_id, "quantity": p.quantity, "price": p.price} for p in (row.products or [])]
             time_id = upsert_time_dimension(db, row.timestamp)
             
             batch.append({
                 "transaction_id": row.transaction_id, "user_id": row.user_id,
                 "time_id": time_id, "timestamp": row.timestamp,
-                "total_amount": total_amount, "payment_method": row.payment_method,
+                "total_amount": float(total_amount), 
+                "payment_method": row.payment_method,
                 "products": products_list, "num_products": len(products_list)
             })
             if len(batch) >= 1000:
@@ -351,12 +359,19 @@ def write_sessions_partition(iterator):
     batch = []
     try:
         for row in iterator:
-            events_list = [{"event_type": e.eventType, "event_timestamp": e.timestamp} for e in (row.events or [])]
+            events_list = [{
+                "event_type": e.eventType, 
+                "product_id": e.product_id, 
+                "event_timestamp": e.timestamp
+            } for e in (row.events or [])]
+
             time_id = upsert_time_dimension(db, row.timestamp)
             
             batch.append({
-                "session_id": row.session_id, "user_id": row.user_id,
-                "time_id": time_id, "timestamp": row.timestamp,
+                "session_id": row.session_id, 
+                "user_id": row.user_id,
+                "time_id": time_id, 
+                "timestamp": row.timestamp,
                 "num_events": len(events_list),
                 "session_duration": len(events_list) * 10,
                 "events": events_list
@@ -393,7 +408,7 @@ def write_audit_partition(iterator, source_collection):
     finally: client.close()
 
 
-# ==================== Write Entry Points (Driver Side) ====================
+# ==================== Write Entry Points ====================
 
 def write_users_to_mongodb(batch_df, batch_id):
     batch_df.rdd.foreachPartition(write_users_partition)
@@ -417,12 +432,14 @@ def write_audit_to_mongodb(batch_df, batch_id, source_collection):
         print(f"⚠ Batch {batch_id}: Audited Anomalies for {source_collection}")
 
 def write_processed_to_kafka(df, processed_topic, checkpoint_suffix):
+    # Convert dataframe to JSON "value"
     kafka_df = df.select(to_json(struct(*df.columns)).alias("value"))
+    
     return kafka_df.writeStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", KAFKA_BROKERS) \
         .option("topic", processed_topic) \
-        .option("checkpointLocation", f"{CHECKPOINT_PATH}/{checkpoint_suffix}_kafka") \
+        .option("checkpointLocation", f"{CHECKPOINT_PATH}/{checkpoint_suffix}") \
         .outputMode("append") \
         .trigger(processingTime='10 seconds') \
         .start()
@@ -440,7 +457,8 @@ def process_users(spark):
         .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_audit") \
         .start()
         
-    kafka_query = write_processed_to_kafka(valid_stream, PROCESSED_TOPICS['users'], f"{topic}_processed")
+    kafka_query = write_processed_to_kafka(valid_stream, PROCESSED_TOPICS['users'], f"{topic}_processed_kafka")
+    
     mongo_query = valid_stream.writeStream \
         .foreachBatch(write_users_to_mongodb) \
         .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_mongodb") \
@@ -459,7 +477,8 @@ def process_products(spark):
         .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_audit") \
         .start()
         
-    kafka_query = write_processed_to_kafka(valid_stream, PROCESSED_TOPICS['products'], f"{topic}_processed")
+    kafka_query = write_processed_to_kafka(valid_stream, PROCESSED_TOPICS['products'], f"{topic}_processed_kafka")
+    
     mongo_query = valid_stream.writeStream \
         .foreachBatch(write_products_to_mongodb) \
         .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_mongodb") \
@@ -473,18 +492,39 @@ def process_transactions(spark):
     
     valid_stream, invalid_stream = process_transactions_data(parsed)
     
+    # 1. Audit Stream
     audit_query = invalid_stream.writeStream \
         .foreachBatch(lambda df, id: write_audit_to_mongodb(df, id, "fact_transactions")) \
         .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_audit") \
         .start()
         
-    kafka_query = write_processed_to_kafka(valid_stream, PROCESSED_TOPICS['transactions'], f"{topic}_processed")
+    # 2. Processed Full Data Stream (Kafka)
+    kafka_query = write_processed_to_kafka(valid_stream, PROCESSED_TOPICS['transactions'], f"{topic}_processed_kafka")
+    
+    # 3. Processed Mongo Stream
     mongo_query = valid_stream.writeStream \
         .foreachBatch(write_transactions_to_mongodb) \
         .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_mongodb") \
         .start()
+
+    # 4. NEW: Real-time Analytics Stream (Aggregated row-basis)
+    # We select only the columns relevant for analytics
+    analytics_df = valid_stream.select(
+        col("transaction_id"),
+        col("timestamp"),
+        col("total_amount")
+    )
+    
+    # Write to the new topic 'realtime_analytics'
+    # IMPORTANT: We use a NEW checkpoint suffix "transactions_analytics" 
+    # This guarantees a fresh state, avoiding the previous checkpoint issues.
+    analytics_query = write_processed_to_kafka(
+        analytics_df, 
+        ANALYTICS_TOPIC, 
+        "transactions_analytics_kafka"
+    )
         
-    return [audit_query, kafka_query, mongo_query]
+    return [audit_query, kafka_query, mongo_query, analytics_query]
 
 def process_sessions(spark):
     topic = TOPICS['sessions']
@@ -497,7 +537,8 @@ def process_sessions(spark):
         .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_audit") \
         .start()
         
-    kafka_query = write_processed_to_kafka(valid_stream, PROCESSED_TOPICS['sessions'], f"{topic}_processed")
+    kafka_query = write_processed_to_kafka(valid_stream, PROCESSED_TOPICS['sessions'], f"{topic}_processed_kafka")
+    
     mongo_query = valid_stream.writeStream \
         .foreachBatch(write_sessions_to_mongodb) \
         .option("checkpointLocation", f"{CHECKPOINT_PATH}/{topic}_mongodb") \
@@ -507,7 +548,7 @@ def process_sessions(spark):
 
 def main():
     print("=" * 60)
-    print("GlobalMart Spark ELT: Anomaly Detection & Serialization Fixed")
+    print("GlobalMart Spark ELT: Real-time Analytics Stream Added")
     print("=" * 60)
     
     spark = create_spark_session()
@@ -519,7 +560,7 @@ def main():
     queries.extend(process_sessions(spark))
     
     print(f"\n✓ Started {len(queries)} streams.")
-    print("✓ Data flow: Kafka -> Spark -> (MongoDB / Audit / Kafka)")
+    print("✓ Data flow: Kafka -> Spark -> (MongoDB / Audit / Kafka [Processed & Analytics])")
     
     try:
         spark.streams.awaitAnyTermination()

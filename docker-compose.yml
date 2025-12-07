@@ -95,6 +95,7 @@ services:
       - GF_PLUGINS_PREINSTALL_SYNC=grafana-mongodb-datasource
     volumes:
       - ./grafana/provisioning/:/etc/grafana/provisioning/
+      - grafana_data:/var/lib/grafana 
     depends_on:
       - "prometheus"
     networks:
@@ -282,3 +283,4 @@ volumes:
   mongo3_data:
   mongo3_config:
   metabase_data:
+  grafana_data:      
